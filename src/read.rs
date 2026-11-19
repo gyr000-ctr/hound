@@ -231,6 +231,17 @@ pub struct WavReader<R> {
     /// The number of samples read so far.
     samples_read: u32,
 
+    /// Whether the length of the data chunk is unknown.
+    ///
+    /// A data chunk length of `0xFFFFFFFF` in the header is the signal value
+    /// for "unknown length", written when streaming to a non-seekable sink
+    /// (see `WavWriter::new_stream`). The data chunk of such a stream is
+    /// delimited by the end of the stream rather than by the length field.
+    unknown_len: bool,
+
+    /// Whether the end of an unknown-length stream has been reached.
+    stream_ended: bool,
+
     /// The reader from which the WAVE format is read.
     reader: R,
 }
@@ -597,23 +608,37 @@ impl<R> WavReader<R>
         try!(read_wave_header(&mut reader));
         let (spec_ex, data_len) = try!(read_until_data(&mut reader));
 
-        let num_samples = data_len / spec_ex.bytes_per_sample as u32;
+        // A data chunk length of 0xFFFFFFFF is the signal value for "unknown
+        // length": the data chunk extends to the end of the stream. This is
+        // written when streaming to a non-seekable sink (see
+        // `WavWriter::new_stream`), and by encoders such as FFmpeg.
+        let unknown_len = data_len == std::u32::MAX;
 
-        // It could be that num_samples * bytes_per_sample < data_len.
-        // If data_len is not a multiple of bytes_per_sample, there is some
-        // trailing data. Either somebody is playing some steganography game,
-        // but more likely something is very wrong, and we should refuse to
-        // decode the file, as it is invalid.
-        if num_samples * spec_ex.bytes_per_sample as u32 != data_len {
-            let msg = "data chunk length is not a multiple of sample size";
-            return Err(Error::FormatError(msg));
-        }
+        let num_samples = if unknown_len {
+            // The real number of samples is not known up front; iteration
+            // ends at the end of the stream instead.
+            std::u32::MAX
+        } else {
+            data_len / spec_ex.bytes_per_sample as u32
+        };
 
-        // The number of samples must be a multiple of the number of channels,
-        // otherwise the last inter-channel sample would not have data for all
-        // channels.
-        if num_samples % spec_ex.spec.channels as u32 != 0 {
-            return Err(Error::FormatError("invalid data chunk length"));
+        if !unknown_len {
+            // It could be that num_samples * bytes_per_sample < data_len.
+            // If data_len is not a multiple of bytes_per_sample, there is some
+            // trailing data. Either somebody is playing some steganography game,
+            // but more likely something is very wrong, and we should refuse to
+            // decode the file, as it is invalid.
+            if num_samples * spec_ex.bytes_per_sample as u32 != data_len {
+                let msg = "data chunk length is not a multiple of sample size";
+                return Err(Error::FormatError(msg));
+            }
+
+            // The number of samples must be a multiple of the number of channels,
+            // otherwise the last inter-channel sample would not have data for all
+            // channels.
+            if num_samples % spec_ex.spec.channels as u32 != 0 {
+                return Err(Error::FormatError("invalid data chunk length"));
+            }
         }
 
         let wav_reader = WavReader {
@@ -621,6 +646,8 @@ impl<R> WavReader<R>
             bytes_per_sample: spec_ex.bytes_per_sample,
             num_samples: num_samples,
             samples_read: 0,
+            unknown_len: unknown_len,
+            stream_ended: false,
             reader: reader,
         };
 
@@ -677,6 +704,10 @@ impl<R> WavReader<R>
     /// in units of samples. The duration in seconds can be obtained by
     /// dividing this number by the sample rate. The duration is independent of
     /// how many samples have been read already.
+    ///
+    /// For a stream with an unknown data chunk length (signalled by
+    /// `0xFFFFFFFF` in the header), the duration is not known up front; this
+    /// method returns a placeholder based on `u32::MAX` samples.
     pub fn duration(&self) -> u32 {
         self.num_samples / self.spec.channels as u32
     }
@@ -687,6 +718,11 @@ impl<R> WavReader<R>
     /// channels. The length is independent of how many samples have been read
     /// already. To get the number of samples left, use `len()` on the
     /// `samples()` iterator.
+    ///
+    /// For a stream with an unknown data chunk length (signalled by
+    /// `0xFFFFFFFF` in the header), the number of samples is not known up
+    /// front and this method returns `u32::MAX`. Iterate until the iterator
+    /// is exhausted to delimit such a stream by its end.
     pub fn len(&self) -> u32 {
         self.num_samples
     }
@@ -735,6 +771,10 @@ fn iter_next<R, S>(reader: &mut WavReader<R>) -> Option<Result<S>>
     where R: io::Read,
           S: Sample
 {
+    if reader.unknown_len {
+        return iter_next_unknown_len(reader);
+    }
+
     if reader.samples_read < reader.num_samples {
         reader.samples_read += 1;
         let sample = Sample::read(&mut reader.reader,
@@ -747,7 +787,79 @@ fn iter_next<R, S>(reader: &mut WavReader<R>) -> Option<Result<S>>
     }
 }
 
+/// Reads one sample from a stream whose data chunk length is unknown.
+///
+/// The data chunk is delimited by the end of the stream: a clean end of
+/// stream at a sample boundary ends the iteration, while a stream that ends
+/// in the middle of a sample, or with a number of samples that is not a
+/// multiple of the channel count, yields `Error::StreamTruncated` once.
+fn iter_next_unknown_len<R, S>(reader: &mut WavReader<R>) -> Option<Result<S>>
+    where R: io::Read,
+          S: Sample
+{
+    if reader.stream_ended {
+        return None;
+    }
+
+    let num_bytes = reader.bytes_per_sample as usize;
+
+    // Hound can decode samples of at most 4 bytes. For wider containers
+    // `Sample::read` returns an error without reading, so delegate to keep
+    // the error consistent with the known-length case. End the stream
+    // afterwards so that iteration terminates.
+    if num_bytes > 4 {
+        reader.stream_ended = true;
+        let sample = Sample::read(&mut reader.reader,
+                                  reader.spec.sample_format,
+                                  reader.bytes_per_sample,
+                                  reader.spec.bits_per_sample);
+        return Some(sample.map_err(Error::from));
+    }
+
+    // Read one sample, but tolerate the end of the stream: unlike
+    // `read_into`, this does not treat a clean end of stream as an error.
+    let mut buf = [0u8; 4];
+    let mut filled = 0;
+    while filled < num_bytes {
+        match reader.reader.read(&mut buf[filled..num_bytes]) {
+            Ok(0) => break,
+            Ok(progress) => filled += progress,
+            Err(err) => {
+                reader.stream_ended = true;
+                return Some(Err(Error::IoError(err)));
+            }
+        }
+    }
+
+    if filled == num_bytes {
+        reader.samples_read += 1;
+        let mut bytes: &[u8] = &buf[..num_bytes];
+        let sample = Sample::read(&mut bytes,
+                                  reader.spec.sample_format,
+                                  reader.bytes_per_sample,
+                                  reader.spec.bits_per_sample);
+        Some(sample.map_err(Error::from))
+    } else {
+        reader.stream_ended = true;
+        // If the stream ended at a sample boundary and the number of samples
+        // read is a multiple of the channel count, the stream ended cleanly.
+        // Otherwise it was truncated in the middle of a sample, or in the
+        // middle of an inter-channel sample (frame).
+        let complete = filled == 0 &&
+            reader.samples_read % reader.spec.channels as u32 == 0;
+        if complete {
+            None
+        } else {
+            Some(Err(Error::StreamTruncated))
+        }
+    }
+}
+
 fn iter_size_hint<R>(reader: &WavReader<R>) -> (usize, Option<usize>) {
+    if reader.unknown_len {
+        // The number of samples is not known until the stream ends.
+        return (0, None);
+    }
     let samples_left = reader.num_samples - reader.samples_read;
     (samples_left as usize, Some(samples_left as usize))
 }

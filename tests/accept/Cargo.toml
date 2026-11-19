@@ -1,0 +1,11 @@
+[package]
+name = "accept"
+version = "0.1.0"
+edition = "2018"
+
+[dependencies]
+hound = { path = "../.." }
+
+# This crate is a stand-alone acceptance test harness for the hound crate in
+# the repository root; it is not part of any enclosing workspace.
+[workspace]

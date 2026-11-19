@@ -158,7 +158,7 @@ fn verify_channel_mask() {
 /// called, the file will be finalized upon drop. However, finalization may
 /// fail, and without calling `finalize`, such a failure cannot be observed.
 pub struct WavWriter<W>
-    where W: io::Write + io::Seek
+    where W: io::Write
 {
     /// Specifies properties of the audio data.
     spec: WavSpec,
@@ -187,11 +187,30 @@ pub struct WavWriter<W>
     /// support different size fmt chunks, and other chunks interspersed, the
     /// offset is flexible.
     data_len_offset: u32,
+
+    /// Seeks the underlying writer, if it is seekable.
+    ///
+    /// This is `Some` for writers created with `new()` (or the appending
+    /// constructors), and `None` for writers created with `new_stream()`,
+    /// which accept underlying writers that do not implement `io::Seek`.
+    /// When it is `None`, the length fields in the header hold the signal
+    /// value `0xFFFFFFFF` ("unknown length"), and they cannot be
+    /// back-patched when the writer is finalized.
+    seeker: Option<fn(&mut W, io::SeekFrom) -> io::Result<u64>>,
 }
 
 enum FmtKind {
     PcmWaveFormat,
     WaveFormatExtensible,
+}
+
+/// Seeks `writer` to `pos`.
+///
+/// This free function is used to obtain a function pointer that performs
+/// `Seek::seek` on a concrete writer type, so that `WavWriter` can store
+/// the ability to seek (or the absence of it) as a runtime value.
+fn seek_fn<W: io::Seek>(writer: &mut W, pos: io::SeekFrom) -> io::Result<u64> {
+    writer.seek(pos)
 }
 
 impl<W> WavWriter<W>
@@ -225,6 +244,66 @@ impl<W> WavWriter<W>
     /// This writes parts of the header immediately, hence a `Result` is
     /// returned.
     pub fn new_with_spec_ex(writer: W, spec_ex: WavSpecEx) -> Result<WavWriter<W>> {
+        WavWriter::new_internal(writer, spec_ex, Some(seek_fn::<W>))
+    }
+
+    /// Updates the WAVE header (which requires knowing all samples).
+    ///
+    /// This method must be called after all samples have been written. If it
+    /// is not called, the destructor will finalize the file, but any errors
+    /// that occur in the process cannot be observed in that manner.
+    ///
+    /// This is an alias for [`finish()`](#method.finish).
+    pub fn finalize(self) -> Result<()> {
+        self.finish()
+    }
+}
+
+impl<W> WavWriter<W>
+    where W: io::Write
+{
+    /// Creates a writer that streams the WAVE format to a non-seekable writer.
+    ///
+    /// Unlike `new()`, this constructor does not require the underlying
+    /// writer to implement `io::Seek`, so WAVE data can be written to pipes,
+    /// sockets, or stdout while samples arrive, e.g. when recording. Because
+    /// the total length is not known up front and cannot be back-patched
+    /// into a stream that was already written, the length fields in the
+    /// header are set to `0xFFFFFFFF`, the signal value for "unknown length"
+    /// that is also used by e.g. FFmpeg. Readers (including `WavReader`)
+    /// treat such a data chunk as delimited by the end of the stream.
+    ///
+    /// The writer keeps a running count of the samples written, so `len()`
+    /// and `duration()` work as usual. No buffering is performed internally;
+    /// peak memory usage is constant regardless of the number of samples
+    /// written.
+    ///
+    /// To end the stream, drop the writer (or call `flush()` to push out
+    /// buffered data). `finish()` cannot back-patch the lengths into a
+    /// non-seekable stream and returns `Error::CannotFinalize`; if the
+    /// underlying writer is seekable, construct the writer with `new()`
+    /// instead so that `finish()` can back-patch the true lengths.
+    ///
+    /// This writes parts of the header immediately, hence a `Result` is
+    /// returned.
+    pub fn new_stream(writer: W, spec: WavSpec) -> Result<WavWriter<W>> {
+        let spec_ex = WavSpecEx {
+            spec: spec,
+            bytes_per_sample: (spec.bits_per_sample + 7) / 8,
+        };
+        WavWriter::new_internal(writer, spec_ex, None)
+    }
+
+    /// Constructs a writer and writes the header up to the data chunk.
+    ///
+    /// `seeker` should be `Some` when the underlying writer is seekable (so
+    /// the header lengths can be back-patched later), and `None` for a
+    /// non-seekable stream, in which case the header is written with the
+    /// "unknown length" signal value `0xFFFFFFFF`.
+    fn new_internal(writer: W,
+                    spec_ex: WavSpecEx,
+                    seeker: Option<fn(&mut W, io::SeekFrom) -> io::Result<u64>>)
+                    -> Result<WavWriter<W>> {
         let spec = spec_ex.spec;
 
         // Write the older PCMWAVEFORMAT structure if possible, because it is
@@ -248,6 +327,7 @@ impl<W> WavWriter<W>
                 FmtKind::WaveFormatExtensible => 64,
                 FmtKind::PcmWaveFormat => 40,
             },
+            seeker: seeker,
         };
 
         // Hound can only write those bit depths. If something else was
@@ -283,7 +363,9 @@ impl<W> WavWriter<W>
             try!(buffer.write_all("RIFF".as_bytes()));
 
             // Skip 4 bytes that will be filled with the file size afterwards.
-            try!(buffer.write_le_u32(0));
+            // A non-seekable stream cannot back-patch the size, so it writes
+            // the "unknown length" signal value instead.
+            try!(buffer.write_le_u32(self.len_placeholder()));
 
             try!(buffer.write_all("WAVE".as_bytes()));
             try!(buffer.write_all("fmt ".as_bytes()));
@@ -298,16 +380,29 @@ impl<W> WavWriter<W>
             }
 
             // Finally the header of the "data" chunk. The number of bytes
-            // that this will take is not known at this point. The 0 will
-            // be overwritten later.
+            // that this will take is not known at this point. For a seekable
+            // writer the placeholder will be overwritten later; a
+            // non-seekable stream keeps the "unknown length" signal value.
             try!(buffer.write_all("data".as_bytes()));
-            try!(buffer.write_le_u32(0));
+            try!(buffer.write_le_u32(self.len_placeholder()));
         }
 
         // The data length field are the last 4 bytes of the header.
         let header_len = self.data_len_offset as usize + 4;
 
         self.writer.write_all(&header[..header_len])
+    }
+
+    /// Returns the placeholder for the length fields in the header.
+    fn len_placeholder(&self) -> u32 {
+        if self.seeker.is_some() {
+            // Back-patched with the true length at finalization time.
+            0
+        } else {
+            // The signal value for "unknown length": the data chunk is
+            // delimited by the end of the stream.
+            std::u32::MAX
+        }
     }
 
     /// Writes the spec as a WAVEFORMAT structure.
@@ -510,6 +605,14 @@ impl<W> WavWriter<W>
         }
     }
 
+    /// Seeks the underlying writer, or fails if it is not seekable.
+    fn seek_writer(&mut self, pos: io::SeekFrom) -> Result<u64> {
+        match self.seeker {
+            Some(seek) => Ok(try!(seek(&mut self.writer, pos))),
+            None => Err(Error::CannotFinalize),
+        }
+    }
+
     fn update_header(&mut self) -> Result<()> {
         // The header size minus magic and 32-bit filesize (8 bytes).
         // The data chunk length (4 bytes) is the last part of the header.
@@ -523,9 +626,9 @@ impl<W> WavWriter<W>
         let header_size = self.data_len_offset + 4 - 8;
         let file_size = self.data_bytes_written.saturating_add(header_size);
 
-        try!(self.writer.seek(io::SeekFrom::Start(4)));
+        try!(self.seek_writer(io::SeekFrom::Start(4)));
         try!(self.writer.write_le_u32(file_size));
-        try!(self.writer.seek(io::SeekFrom::Start(self.data_len_offset as u64)));
+        try!(self.seek_writer(io::SeekFrom::Start(self.data_len_offset as u64)));
         try!(self.writer.write_le_u32(self.data_bytes_written));
 
         // Signal error if the last sample was not finished, but do so after
@@ -539,15 +642,19 @@ impl<W> WavWriter<W>
         }
     }
 
-    /// Updates the WAVE header and flushes the underlying writer.
+    /// Updates the WAVE header if possible, and flushes the underlying writer.
     ///
-    /// Flush writes the WAVE header to the underlying writer to make the
-    /// written bytes a valid wav file, and then flushes the writer. It is still
-    /// possible to write more samples after flushing.
+    /// For a seekable writer, flush writes the WAVE header to the underlying
+    /// writer to make the written bytes a valid wav file, and then flushes
+    /// the writer. It is still possible to write more samples after flushing.
     ///
     /// Flush can be used for “checkpointing”. Even if after the flush there is
     /// an IO error or the writing process dies, the file can still be read by a
     /// compliant decoder up to the last flush.
+    ///
+    /// For a stream created with `new_stream()`, the header holds the
+    /// "unknown length" signal value and there is nothing to back-patch, so
+    /// flush only flushes the underlying writer.
     ///
     /// Note that if the number of samples written is not a multiple of the
     /// channel count, the intermediate wav file will not be valid. In that case
@@ -557,25 +664,48 @@ impl<W> WavWriter<W>
     /// It is not necessary to call `finalize()` directly after `flush()`, if no
     /// samples have been written after flushing.
     pub fn flush(&mut self) -> Result<()> {
-        let current_pos = try!(self.writer.seek(io::SeekFrom::Current(0)));
-        try!(self.update_header());
-        try!(self.writer.flush());
-        try!(self.writer.seek(io::SeekFrom::Start(current_pos)));
-        Ok(())
+        if self.seeker.is_some() {
+            let current_pos = try!(self.seek_writer(io::SeekFrom::Current(0)));
+            try!(self.update_header());
+            try!(self.writer.flush());
+            try!(self.seek_writer(io::SeekFrom::Start(current_pos)));
+            Ok(())
+        } else {
+            try!(self.writer.flush());
+            // Mirror the unfinished-sample check of the seekable path: the
+            // stream written so far is ill-formed if the last sample was not
+            // finished.
+            if (self.data_bytes_written / self.bytes_per_sample as u32)
+                % self.spec.channels as u32 != 0 {
+                Err(Error::UnfinishedSample)
+            } else {
+                Ok(())
+            }
+        }
     }
 
-    /// Updates the WAVE header (which requires knowing all samples).
+    /// Back-patches the sample counts into the WAVE header and flushes.
     ///
     /// This method must be called after all samples have been written. If it
-    /// is not called, the destructor will finalize the file, but any errors
-    /// that occur in the process cannot be observed in that manner.
-    pub fn finalize(mut self) -> Result<()> {
+    /// is not called, the destructor will finalize the file if possible, but
+    /// any errors that occur in the process cannot be observed in that
+    /// manner.
+    ///
+    /// Finishing requires seeking back to the header to write the final
+    /// lengths. For a writer created with `new_stream()` the header was
+    /// written with the "unknown length" signal value `0xFFFFFFFF`, and the
+    /// counts cannot be back-patched into the stream that was already
+    /// written; in that case this method returns `Error::CannotFinalize`.
+    /// Drop the writer instead to end such a stream, and let the reader
+    /// delimit the data by the end of the stream.
+    ///
+    /// We need to perform a flush here to truly capture all errors before
+    /// the writer is dropped: for a buffered writer, the write to the buffer
+    /// may succeed, but the write to the underlying writer may fail. So
+    /// flush explicitly.
+    pub fn finish(mut self) -> Result<()> {
         self.finalized = true;
         try!(self.update_header());
-        // We need to perform a flush here to truly capture all errors before
-        // the writer is dropped: for a buffered writer, the write to the buffer
-        // may succeed, but the write to the underlying writer may fail. So
-        // flush explicitly.
         try!(self.writer.flush());
         Ok(())
     }
@@ -609,13 +739,15 @@ impl<W> WavWriter<W>
 }
 
 impl<W> Drop for WavWriter<W>
-    where W: io::Write + io::Seek
+    where W: io::Write
 {
     fn drop(&mut self) {
-        // If the file was not explicitly finalized (to update the headers), do
-        // it in the drop. This can fail, but drop should not panic, so a
-        // failure is ignored silently here.
-        if !self.finalized {
+        // If the file was not explicitly finalized (to update the headers),
+        // do it in the drop when the underlying writer is seekable. For a
+        // non-seekable stream the header intentionally holds the "unknown
+        // length" signal value, so there is nothing to update. Drop should
+        // not panic, so a failure is ignored silently here.
+        if !self.finalized && self.seeker.is_some() {
             let _r = self.update_header();
         }
     }
@@ -712,6 +844,7 @@ impl WavWriter<io::BufWriter<fs::File>> {
             sample_writer_buffer: Vec::new(),
             finalized: false,
             data_len_offset: data_len_offset,
+            seeker: Some(seek_fn::<io::BufWriter<fs::File>>),
         };
 
         Ok(writer)
@@ -742,6 +875,7 @@ impl<W> WavWriter<W> where W: io::Read + io::Write + io::Seek {
             sample_writer_buffer: Vec::new(),
             finalized: false,
             data_len_offset: data_len_offset,
+            seeker: Some(seek_fn::<W>),
         };
 
         Ok(writer)
@@ -765,7 +899,7 @@ impl<W> WavWriter<W> where W: io::Read + io::Write + io::Seek {
 ///
 /// A `SampleWriter16` can be obtained by calling [`WavWriter::get_i16_writer`](
 /// struct.WavWriter.html#method.get_i16_writer).
-pub struct SampleWriter16<'parent, W> where W: io::Write + io::Seek + 'parent {
+pub struct SampleWriter16<'parent, W> where W: io::Write + 'parent {
     /// The writer borrowed from the wrapped WavWriter.
     writer: &'parent mut W,
 
@@ -782,7 +916,7 @@ pub struct SampleWriter16<'parent, W> where W: io::Write + io::Seek + 'parent {
     index: u32,
 }
 
-impl<'parent, W: io::Write + io::Seek> SampleWriter16<'parent, W> {
+impl<'parent, W: io::Write> SampleWriter16<'parent, W> {
     /// Writes a single sample for one channel.
     ///
     /// WAVE interleaves channel data, so the channel that this writes the
