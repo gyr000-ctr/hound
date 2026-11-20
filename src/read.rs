@@ -67,6 +67,9 @@ pub trait ReadExt: io::Read {
     /// Reads four bytes and interprets them as a little-endian 32-bit unsigned integer.
     fn read_le_u32(&mut self) -> io::Result<u32>;
 
+    /// Reads eight bytes and interprets them as a little-endian 64-bit unsigned integer.
+    fn read_le_u64(&mut self) -> io::Result<u64>;
+
     /// Reads four bytes and interprets them as a little-endian 32-bit IEEE float.
     fn read_le_f32(&mut self) -> io::Result<f32>;
 }
@@ -186,6 +189,16 @@ impl<R> ReadExt for R
     }
 
     #[inline(always)]
+    fn read_le_u64(&mut self) -> io::Result<u64> {
+        let mut buf = [0u8; 8];
+        try!(self.read_into(&mut buf));
+        Ok((buf[7] as u64) << 56 | (buf[6] as u64) << 48 |
+           (buf[5] as u64) << 40 | (buf[4] as u64) << 32 |
+           (buf[3] as u64) << 24 | (buf[2] as u64) << 16 |
+           (buf[1] as u64) << 8  | (buf[0] as u64) << 0)
+    }
+
+    #[inline(always)]
     fn read_le_f32(&mut self) -> io::Result<f32> {
         let mut buf = [0u8; 4];
         try!(self.read_into(&mut buf));
@@ -194,10 +207,12 @@ impl<R> ReadExt for R
 }
 
 /// The different chunks that a WAVE file can contain.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ChunkKind {
     Fmt,
     Fact,
     Data,
+    Ds64,
     Unknown,
 }
 
@@ -223,13 +238,13 @@ pub struct WavReader<R> {
 
     /// The number of samples in the data chunk.
     ///
-    /// The data chunk is limited to a 4 GiB length because its header has a
-    /// 32-bit length field. A sample takes at least one byte to store, so the
-    /// number of samples is always less than 2^32.
-    num_samples: u32,
+    /// For a classic WAVE file the data chunk is limited to a 4 GiB length
+    /// because its header has a 32-bit length field, but an RF64 file stores
+    /// 64-bit lengths, so the number of samples can exceed 2^32.
+    num_samples: u64,
 
     /// The number of samples read so far.
-    samples_read: u32,
+    samples_read: u64,
 
     /// The reader from which the WAVE format is read.
     reader: R,
@@ -255,23 +270,30 @@ pub struct WavIntoSamples<R, S> {
     phantom_sample: marker::PhantomData<S>,
 }
 
-/// Reads the RIFF WAVE header, returns the supposed file size.
+/// The container kind of a WAVE file: classic RIFF or 64-bit RF64.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RiffKind {
+    /// A classic WAVE file that starts with the `RIFF` magic.
+    Riff,
+    /// An RF64 file (EBU Tech 3306) that starts with the `RF64` magic and
+    /// stores its true lengths in a `ds64` chunk.
+    Rf64,
+}
+
+/// Reads the RIFF or RF64 WAVE header, returns the kind and supposed file size.
 ///
-/// This function can be used to quickly check if the file could be a wav file
-/// by reading 12 bytes of the header. If an `Ok` is returned, the file is
-/// likely a wav file. If an `Err` is returned, it is definitely not a wav
-/// file.
-///
-/// The returned file size cannot be larger than 2<sup>32</sup> + 7 bytes.
-pub fn read_wave_header<R: io::Read>(reader: &mut R) -> Result<u64> {
-    // Every WAVE file starts with the four bytes 'RIFF' and a file length.
-    // TODO: the old approach of having a slice on the stack and reading
-    // into it is more cumbersome, but also avoids a heap allocation. Is
-    // the compiler smart enough to avoid the heap allocation anyway? I
-    // would not expect it to be.
-    if b"RIFF" != &try!(reader.read_4_bytes())[..] {
-        return Err(Error::FormatError("no RIFF tag found"));
-    }
+/// This is like `read_wave_header`, but it also reports whether the file is a
+/// classic RIFF file or an RF64 file. For an RF64 file the returned file size
+/// is meaningless (the 32-bit length field conventionally holds `0xffffffff`);
+/// the true length is stored in the `ds64` chunk.
+pub fn read_riff_header<R: io::Read>(reader: &mut R) -> Result<(RiffKind, u64)> {
+    // Every WAVE file starts with the four bytes 'RIFF' (or 'RF64' for the
+    // 64-bit extension of the format) and a file length.
+    let kind = match &try!(reader.read_4_bytes())[..] {
+        b"RIFF" => RiffKind::Riff,
+        b"RF64" => RiffKind::Rf64,
+        _ => return Err(Error::FormatError("no RIFF tag found")),
+    };
 
     let file_len = try!(reader.read_le_u32());
 
@@ -282,7 +304,22 @@ pub fn read_wave_header<R: io::Read>(reader: &mut R) -> Result<u64> {
 
     // The stored file length does not include the "RIFF" magic and 4-byte
     // length field, so the total size is 8 bytes more than what is stored.
-    Ok(file_len as u64 + 8)
+    Ok((kind, file_len as u64 + 8))
+}
+
+/// Reads the RIFF WAVE header, returns the supposed file size.
+///
+/// This function can be used to quickly check if the file could be a wav file
+/// by reading 12 bytes of the header. If an `Ok` is returned, the file is
+/// likely a wav file. If an `Err` is returned, it is definitely not a wav
+/// file.
+///
+/// The returned file size cannot be larger than 2<sup>32</sup> + 7 bytes. For
+/// an RF64 file the 32-bit length field conventionally holds `0xffffffff`, so
+/// the returned size is meaningless; the true length is stored in the `ds64`
+/// chunk.
+pub fn read_wave_header<R: io::Read>(reader: &mut R) -> Result<u64> {
+    read_riff_header(reader).map(|(_kind, file_len)| file_len)
 }
 
 /// Reads chunks until a data chunk is encountered.
@@ -290,12 +327,48 @@ pub fn read_wave_header<R: io::Read>(reader: &mut R) -> Result<u64> {
 /// Returns the information from the fmt chunk and the length of the data
 /// chunk in bytes. Afterwards, the reader will be positioned at the first
 /// content byte of the data chunk.
-pub fn read_until_data<R: io::Read>(mut reader: R) -> Result<(WavSpecEx, u32)> {
+///
+/// When `is_rf64` is true, the file must start with a `ds64` chunk (otherwise
+/// `Error::MissingDs64` is returned), and the length of the data chunk is
+/// taken from that chunk. A 32-bit data chunk length that is neither
+/// `0xffffffff` nor equal to the 64-bit length in the `ds64` chunk is
+/// rejected with `Error::InconsistentDs64`.
+pub fn read_until_data<R: io::Read>(mut reader: R, is_rf64: bool) -> Result<(WavSpecEx, u64)> {
     let mut spec_opt = None;
+    let mut ds64_data_len = None;
+    let mut is_first_chunk = true;
 
     loop {
         let header = try!(WavReader::read_chunk_header(&mut reader));
+
+        // In an RF64 file, the ds64 chunk must be the first chunk: it stores
+        // the true 64-bit lengths that the 32-bit fields cannot represent.
+        if is_rf64 && is_first_chunk && header.kind != ChunkKind::Ds64 {
+            return Err(Error::MissingDs64);
+        }
+        is_first_chunk = false;
+
         match header.kind {
+            ChunkKind::Ds64 => {
+                if !is_rf64 {
+                    // A ds64 chunk is meaningless in a classic RIFF file;
+                    // ignore it like any other unrecognized chunk.
+                    try!(reader.skip_bytes(header.len as usize));
+                    continue;
+                }
+                // The ds64 chunk holds at least the riff size, the data size,
+                // the sample count (all u64), and the table length (u32).
+                if header.len < 28 {
+                    return Err(Error::FormatError("invalid ds64 chunk size"));
+                }
+                let _riff_len = try!(reader.read_le_u64());
+                let data_len = try!(reader.read_le_u64());
+                let _num_samples = try!(reader.read_le_u64());
+                let _table_len = try!(reader.read_le_u32());
+                ds64_data_len = Some(data_len);
+                // Ignore the table entries and any trailing bytes.
+                try!(reader.skip_bytes((header.len - 28) as usize));
+            }
             ChunkKind::Fmt => {
                 let spec = try!(WavReader::read_fmt_chunk(&mut reader, header.len));
                 spec_opt = Some(spec);
@@ -316,10 +389,26 @@ pub fn read_until_data<R: io::Read>(mut reader: R) -> Result<(WavSpecEx, u32)> {
             ChunkKind::Data => {
                 // The "fmt" chunk must precede the "data" chunk. Any
                 // chunks that come after the data chunk will be ignored.
-                if let Some(spec) = spec_opt {
-                    return Ok((spec, header.len));
+                let spec = match spec_opt {
+                    Some(spec) => spec,
+                    None => return Err(Error::FormatError("missing fmt chunk")),
+                };
+
+                if !is_rf64 {
+                    return Ok((spec, header.len as u64));
+                }
+
+                // For RF64, the true data length is stored in the ds64 chunk.
+                // The 32-bit length field of the data chunk must be either
+                // 0xffffffff (meaning: see the ds64 chunk) or agree with it.
+                let ds64_data_len = match ds64_data_len {
+                    Some(len) => len,
+                    None => return Err(Error::MissingDs64),
+                };
+                if header.len == 0xff_ff_ff_ff || header.len as u64 == ds64_data_len {
+                    return Ok((spec, ds64_data_len));
                 } else {
-                    return Err(Error::FormatError("missing fmt chunk"));
+                    return Err(Error::InconsistentDs64);
                 }
             }
             ChunkKind::Unknown => {
@@ -345,6 +434,7 @@ impl<R> WavReader<R>
             b"fmt " => ChunkKind::Fmt,
             b"fact" => ChunkKind::Fact,
             b"data" => ChunkKind::Data,
+            b"ds64" => ChunkKind::Ds64,
             _ => ChunkKind::Unknown,
         };
 
@@ -592,19 +682,20 @@ impl<R> WavReader<R>
     /// Attempts to create a reader that reads the WAVE format.
     ///
     /// The header is read immediately. Reading the data will be done on
-    /// demand.
+    /// demand. Both classic RIFF files and RF64 files are recognized
+    /// automatically.
     pub fn new(mut reader: R) -> Result<WavReader<R>> {
-        try!(read_wave_header(&mut reader));
-        let (spec_ex, data_len) = try!(read_until_data(&mut reader));
+        let (riff_kind, _file_len) = try!(read_riff_header(&mut reader));
+        let (spec_ex, data_len) = try!(read_until_data(&mut reader, riff_kind == RiffKind::Rf64));
 
-        let num_samples = data_len / spec_ex.bytes_per_sample as u32;
+        let num_samples = data_len / spec_ex.bytes_per_sample as u64;
 
         // It could be that num_samples * bytes_per_sample < data_len.
         // If data_len is not a multiple of bytes_per_sample, there is some
         // trailing data. Either somebody is playing some steganography game,
         // but more likely something is very wrong, and we should refuse to
         // decode the file, as it is invalid.
-        if num_samples * spec_ex.bytes_per_sample as u32 != data_len {
+        if num_samples * spec_ex.bytes_per_sample as u64 != data_len {
             let msg = "data chunk length is not a multiple of sample size";
             return Err(Error::FormatError(msg));
         }
@@ -612,7 +703,7 @@ impl<R> WavReader<R>
         // The number of samples must be a multiple of the number of channels,
         // otherwise the last inter-channel sample would not have data for all
         // channels.
-        if num_samples % spec_ex.spec.channels as u32 != 0 {
+        if num_samples % spec_ex.spec.channels as u64 != 0 {
             return Err(Error::FormatError("invalid data chunk length"));
         }
 
@@ -676,9 +767,15 @@ impl<R> WavReader<R>
     /// The duration is independent of the number of channels. It is expressed
     /// in units of samples. The duration in seconds can be obtained by
     /// dividing this number by the sample rate. The duration is independent of
-    /// how many samples have been read already.
+    /// how many samples have been read already. The return value saturates at
+    /// `u32::MAX` for RF64 files that hold more samples than that.
     pub fn duration(&self) -> u32 {
-        self.num_samples / self.spec.channels as u32
+        let duration = self.num_samples / self.spec.channels as u64;
+        if duration > std::u32::MAX as u64 {
+            std::u32::MAX
+        } else {
+            duration as u32
+        }
     }
 
     /// Returns the number of values that the sample iterator will yield.
@@ -686,9 +783,14 @@ impl<R> WavReader<R>
     /// The length of the file is its duration (in samples) times the number of
     /// channels. The length is independent of how many samples have been read
     /// already. To get the number of samples left, use `len()` on the
-    /// `samples()` iterator.
+    /// `samples()` iterator. The return value saturates at `u32::MAX` for RF64
+    /// files that hold more samples than that.
     pub fn len(&self) -> u32 {
-        self.num_samples
+        if self.num_samples > std::u32::MAX as u64 {
+            std::u32::MAX
+        } else {
+            self.num_samples as u32
+        }
     }
 
     /// Destroys the `WavReader` and returns the underlying reader.
@@ -710,7 +812,7 @@ impl<R> WavReader<R>
         where R: io::Seek,
     {
         let bytes_per_sample = self.spec.bits_per_sample / 8;
-        let sample_position = time * self.spec.channels as u32;
+        let sample_position = time as u64 * self.spec.channels as u64;
         let offset_samples = sample_position as i64 - self.samples_read as i64;
         let offset_bytes = offset_samples * bytes_per_sample as i64;
         try!(self.reader.seek(io::SeekFrom::Current(offset_bytes)));
@@ -749,7 +851,14 @@ fn iter_next<R, S>(reader: &mut WavReader<R>) -> Option<Result<S>>
 
 fn iter_size_hint<R>(reader: &WavReader<R>) -> (usize, Option<usize>) {
     let samples_left = reader.num_samples - reader.samples_read;
-    (samples_left as usize, Some(samples_left as usize))
+    // Saturate for the (32-bit) platforms where usize cannot hold the number
+    // of samples of a large RF64 file.
+    let samples_left = if samples_left > std::usize::MAX as u64 {
+        std::usize::MAX
+    } else {
+        samples_left as usize
+    };
+    (samples_left, Some(samples_left))
 }
 
 impl<'wr, R, S> Iterator for WavSamples<'wr, R, S>

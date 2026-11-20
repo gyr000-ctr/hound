@@ -53,6 +53,9 @@ pub trait WriteExt: io::Write {
     /// Writes an unsigned 32-bit integer in little endian format.
     fn write_le_u32(&mut self, x: u32) -> io::Result<()>;
 
+    /// Writes an unsigned 64-bit integer in little endian format.
+    fn write_le_u64(&mut self, x: u64) -> io::Result<()>;
+
     /// Writes an IEEE float in little endian format.
     fn write_le_f32(&mut self, x: f32) -> io::Result<()>;
 }
@@ -114,6 +117,20 @@ impl<W> WriteExt for W
     }
 
     #[inline(always)]
+    fn write_le_u64(&mut self, x: u64) -> io::Result<()> {
+        let mut buf = [0u8; 8];
+        buf[0] = ((x >> 00) & 0xff) as u8;
+        buf[1] = ((x >> 08) & 0xff) as u8;
+        buf[2] = ((x >> 16) & 0xff) as u8;
+        buf[3] = ((x >> 24) & 0xff) as u8;
+        buf[4] = ((x >> 32) & 0xff) as u8;
+        buf[5] = ((x >> 40) & 0xff) as u8;
+        buf[6] = ((x >> 48) & 0xff) as u8;
+        buf[7] = ((x >> 56) & 0xff) as u8;
+        self.write_all(&buf)
+    }
+
+    #[inline(always)]
     fn write_le_f32(&mut self, x: f32) -> io::Result<()> {
         let u = unsafe { mem::transmute::<f32, u32>(x) };
         self.write_le_u32(u)
@@ -171,8 +188,11 @@ pub struct WavWriter<W>
 
     /// The number of bytes written to the data section.
     ///
-    /// This is an `u32` because WAVE cannot accomodate more data.
-    data_bytes_written: u32,
+    /// This is a `u64` so that RF64 files can hold more than the 4 GiB that
+    /// a classic WAVE file (with its 32-bit length fields) can accomodate.
+    /// For non-RF64 writers the value never exceeds `u32::MAX`; writing more
+    /// than that fails with `Error::TooMuchData`.
+    data_bytes_written: u64,
 
     /// Whether the header has been finalized.
     finalized: bool,
@@ -187,8 +207,16 @@ pub struct WavWriter<W>
     /// support different size fmt chunks, and other chunks interspersed, the
     /// offset is flexible.
     data_len_offset: u32,
+
+    /// Whether this writer writes an RF64 file instead of a classic RIFF one.
+    ///
+    /// An RF64 file starts with the `RF64` magic instead of `RIFF`, stores
+    /// `0xffffffff` in the 32-bit length fields, and carries the true 64-bit
+    /// lengths in a `ds64` chunk that precedes the `fmt ` chunk.
+    rf64: bool,
 }
 
+#[derive(Clone, Copy)]
 enum FmtKind {
     PcmWaveFormat,
     WaveFormatExtensible,
@@ -214,6 +242,28 @@ impl<W> WavWriter<W>
         WavWriter::new_with_spec_ex(writer, spec_ex)
     }
 
+    /// Creates a writer that writes the RF64 format to the underlying writer.
+    ///
+    /// RF64 is the 64-bit extension of the WAVE format (EBU Tech 3306): the
+    /// file starts with the `RF64` magic instead of `RIFF`, the 32-bit length
+    /// fields are set to `0xffffffff`, and the true 64-bit lengths are stored
+    /// in a `ds64` chunk. This lifts the 4 GiB limit of the classic WAVE
+    /// format, so a writer created with this constructor never fails with
+    /// `Error::TooMuchData`.
+    ///
+    /// The underlying writer is assumed to be at offset 0. `WavWriter` employs
+    /// *no* buffering internally. It is recommended to wrap the writer in a
+    /// `BufWriter` to avoid too many `write` calls.
+    ///
+    /// This writes parts of the header immediately, hence a `Result` is
+    /// returned.
+    pub fn new_rf64(writer: W, spec: WavSpec) -> Result<WavWriter<W>> {
+        let spec_ex = WavSpecEx {
+            spec: spec,
+            bytes_per_sample: (spec.bits_per_sample + 7) / 8,
+        };
+        WavWriter::new_impl(writer, spec_ex, true)
+    }
 
     /// Creates a writer that writes the WAVE format to the underlying writer.
     ///
@@ -225,6 +275,11 @@ impl<W> WavWriter<W>
     /// This writes parts of the header immediately, hence a `Result` is
     /// returned.
     pub fn new_with_spec_ex(writer: W, spec_ex: WavSpecEx) -> Result<WavWriter<W>> {
+        WavWriter::new_impl(writer, spec_ex, false)
+    }
+
+    /// Creates a writer, writing either a classic RIFF header or an RF64 one.
+    fn new_impl(writer: W, spec_ex: WavSpecEx, rf64: bool) -> Result<WavWriter<W>> {
         let spec = spec_ex.spec;
 
         // Write the older PCMWAVEFORMAT structure if possible, because it is
@@ -244,10 +299,14 @@ impl<W> WavWriter<W>
             data_bytes_written: 0,
             sample_writer_buffer: Vec::new(),
             finalized: false,
-            data_len_offset: match fmt_kind {
-                FmtKind::WaveFormatExtensible => 64,
-                FmtKind::PcmWaveFormat => 40,
+            data_len_offset: match (rf64, fmt_kind) {
+                (false, FmtKind::WaveFormatExtensible) => 64,
+                (false, FmtKind::PcmWaveFormat) => 40,
+                // An RF64 file has a 36-byte ds64 chunk before the fmt chunk.
+                (true, FmtKind::WaveFormatExtensible) => 100,
+                (true, FmtKind::PcmWaveFormat) => 76,
             },
+            rf64: rf64,
         };
 
         // Hound can only write those bit depths. If something else was
@@ -274,18 +333,43 @@ impl<W> WavWriter<W>
     /// Writes the RIFF WAVE header, fmt chunk, and data chunk header.
     fn write_headers(&mut self, fmt_kind: FmtKind) -> io::Result<()> {
         // Write to an in-memory buffer before writing to the underlying writer.
-        let mut header = [0u8; 68];
+        // 104 bytes accomodate the largest header: RF64 with a ds64 chunk and
+        // a WAVEFORMATEXTENSIBLE fmt chunk.
+        let mut header = [0u8; 104];
 
         {
             let mut buffer = io::Cursor::new(&mut header[..]);
 
-            // Write the headers for the RIFF WAVE format.
-            try!(buffer.write_all("RIFF".as_bytes()));
+            // Write the headers for the RIFF WAVE format. An RF64 file starts
+            // with the `RF64` magic and stores 0xffffffff in the 32-bit length
+            // fields; the true lengths live in the ds64 chunk.
+            if self.rf64 {
+                try!(buffer.write_all("RF64".as_bytes()));
+                try!(buffer.write_le_u32(0xff_ff_ff_ff));
+            } else {
+                try!(buffer.write_all("RIFF".as_bytes()));
 
-            // Skip 4 bytes that will be filled with the file size afterwards.
-            try!(buffer.write_le_u32(0));
+                // Skip 4 bytes that will be filled with the file size afterwards.
+                try!(buffer.write_le_u32(0));
+            }
 
             try!(buffer.write_all("WAVE".as_bytes()));
+
+            if self.rf64 {
+                // The ds64 chunk holds the true 64-bit lengths. They are not
+                // known yet; the zeroes are overwritten when the writer is
+                // finalized. The chunk must be the first chunk in the file.
+                try!(buffer.write_all("ds64".as_bytes()));
+                // The chunk size: the three u64 fields and the table length.
+                try!(buffer.write_le_u32(28));
+                // The riffSize, dataSize, and sampleCount fields.
+                try!(buffer.write_le_u64(0));
+                try!(buffer.write_le_u64(0));
+                try!(buffer.write_le_u64(0));
+                // The tableLength field: there is no table.
+                try!(buffer.write_le_u32(0));
+            }
+
             try!(buffer.write_all("fmt ".as_bytes()));
 
             match fmt_kind {
@@ -297,11 +381,16 @@ impl<W> WavWriter<W>
                 }
             }
 
-            // Finally the header of the "data" chunk. The number of bytes
-            // that this will take is not known at this point. The 0 will
-            // be overwritten later.
+            // Finally the header of the "data" chunk. For a classic RIFF file
+            // the number of bytes that this will take is not known at this
+            // point; the 0 will be overwritten later. For RF64 the 32-bit
+            // field is always 0xffffffff; the true length lives in ds64.
             try!(buffer.write_all("data".as_bytes()));
-            try!(buffer.write_le_u32(0));
+            if self.rf64 {
+                try!(buffer.write_le_u32(0xff_ff_ff_ff));
+            } else {
+                try!(buffer.write_le_u32(0));
+            }
         }
 
         // The data length field are the last 4 bytes of the header.
@@ -426,29 +515,32 @@ impl<W> WavWriter<W>
     /// sample to depends on previous writes. This will return an error if the
     /// sample does not fit in the number of bits specified in the `WavSpec`.
     ///
-    /// The WAVE format has 32-bit length headers that mean it can hold at most
-    /// 4 GiB of audio data. This function does not fail when you write more
-    /// than that, in order to support streaming cases where the header is
-    /// ignored, and the 4 GiB limit does not apply. After 4 GiB, the size
-    /// fields saturate, and the resulting file will contain more samples than
-    /// its headers indicate. The `duration` and `len` methods report consistent
-    /// with the size headers, so their return values stop being meaningful
-    /// after 4 GiB of data.
+    /// The classic WAVE format has 32-bit length headers that mean it can hold
+    /// at most 4 GiB of audio data. Unless the writer was created with
+    /// `WavWriter::new_rf64`, writing beyond that limit fails with
+    /// `Error::TooMuchData`. For an RF64 writer the limit does not apply and
+    /// this method keeps accepting samples; the 64-bit lengths in the `ds64`
+    /// chunk are updated when the writer is finalized.
     #[inline]
     pub fn write_sample<S: Sample>(&mut self, sample: S) -> Result<()> {
+        if !self.rf64 {
+            // A classic WAVE file cannot hold more than u32::MAX bytes of
+            // data. Fail before writing the sample, so that a failed write
+            // leaves the file in a consistent state.
+            let would_fit = self.data_bytes_written
+                .checked_add(self.bytes_per_sample as u64)
+                .map(|n| n <= std::u32::MAX as u64)
+                .unwrap_or(false);
+            if !would_fit {
+                return Err(Error::TooMuchData);
+            }
+        }
         try!(sample.write_padded(
             &mut self.writer,
             self.spec.bits_per_sample,
             self.bytes_per_sample,
         ));
-        // The saturating add makes `data_bytes_written` a lie when you overflow
-        // the 4 GiB, but it's better than the silent wrapping that happened
-        // previously. We also cannot return an error, because some users depend
-        // on being able to write an "infinite" stream to a pipe, where the
-        // header is never updated and the size limit is not a problem. I think
-        // at this point the entire crate needs to be rewritten with better
-        // APIs, but that's for another time.
-        self.data_bytes_written = self.data_bytes_written.saturating_add(self.bytes_per_sample as u32);
+        self.data_bytes_written += self.bytes_per_sample as u64;
         Ok(())
     }
 
@@ -467,7 +559,8 @@ impl<W> WavWriter<W>
     /// * Attempting to write more than `num_samples` samples to the writer
     ///   panics.
     /// * Panics when `num_samples` would bring the total above 2<sup>31</sup>,
-    ///   which is the maximum that the wav format can represent.
+    ///   which is the maximum that the wav format can represent. This does not
+    ///   apply to RF64 writers, which can hold more data.
     pub fn get_i16_writer<'s>(&'s mut self,
                               num_samples: u32)
                               -> SampleWriter16<'s, W> {
@@ -480,8 +573,14 @@ impl<W> WavWriter<W>
             panic!("When calling get_i16_writer, the number of bits per sample must be 16.");
         }
 
-        let max_samples_left = (u32::MAX - self.data_bytes_written) / 2;
-        if num_samples > max_samples_left {
+        let max_samples_left = if self.rf64 {
+            // An RF64 file stores 64-bit lengths, so the 4 GiB limit of the
+            // classic format does not apply.
+            (std::u64::MAX - self.data_bytes_written) / 2
+        } else {
+            (u32::MAX as u64 - self.data_bytes_written) / 2
+        };
+        if num_samples as u64 > max_samples_left {
             panic!("Not enough space in data section, can have at most 2^31 i16 samples.");
         }
         // Does not overflow because we checked above that there is enough space
@@ -513,26 +612,49 @@ impl<W> WavWriter<W>
     fn update_header(&mut self) -> Result<()> {
         // The header size minus magic and 32-bit filesize (8 bytes).
         // The data chunk length (4 bytes) is the last part of the header.
-        // We use a saturating add for the file size; if the length of the data
-        // section is 4 GiB already, then the file plus header would be larger
-        // than what the format supports. Better than silently writing a header
-        // that is too small would be to return an error, but adding a variant
-        // would be a breaking change which is not worth it at this point. A
-        // reader which reads only the chunk headers can still read the entire
-        // file.
-        let header_size = self.data_len_offset + 4 - 8;
-        let file_size = self.data_bytes_written.saturating_add(header_size);
+        let header_size = self.data_len_offset as u64 + 4 - 8;
 
-        try!(self.writer.seek(io::SeekFrom::Start(4)));
-        try!(self.writer.write_le_u32(file_size));
-        try!(self.writer.seek(io::SeekFrom::Start(self.data_len_offset as u64)));
-        try!(self.writer.write_le_u32(self.data_bytes_written));
+        if self.rf64 {
+            // For RF64, the 32-bit length fields stay 0xffffffff; the true
+            // lengths are stored in the ds64 chunk, which starts right after
+            // the 12-byte "RF64"/size/"WAVE" header: 4 bytes magic, 4 bytes
+            // chunk size, and then the three u64 fields at offset 20.
+            let riff_size = self.data_bytes_written + header_size;
+            let block_align = self.bytes_per_sample as u64 * self.spec.channels as u64;
+            let sample_count = self.data_bytes_written / block_align;
+
+            try!(self.writer.seek(io::SeekFrom::Start(20)));
+            try!(self.writer.write_le_u64(riff_size));
+            try!(self.writer.write_le_u64(self.data_bytes_written));
+            try!(self.writer.write_le_u64(sample_count));
+        } else {
+            // We use a saturating cast for the file size; if the length of the
+            // data section is close to 4 GiB already, then the file plus header
+            // would be larger than what the format supports. A reader which
+            // reads only the chunk headers can still read the entire file.
+            let file_size = self.data_bytes_written + header_size;
+            let file_size = if file_size > std::u32::MAX as u64 {
+                std::u32::MAX
+            } else {
+                file_size as u32
+            };
+            let data_len = if self.data_bytes_written > std::u32::MAX as u64 {
+                std::u32::MAX
+            } else {
+                self.data_bytes_written as u32
+            };
+
+            try!(self.writer.seek(io::SeekFrom::Start(4)));
+            try!(self.writer.write_le_u32(file_size));
+            try!(self.writer.seek(io::SeekFrom::Start(self.data_len_offset as u64)));
+            try!(self.writer.write_le_u32(data_len));
+        }
 
         // Signal error if the last sample was not finished, but do so after
         // everything has been written, so that no data is lost, even though
         // the file is now ill-formed.
-        if (self.data_bytes_written / self.bytes_per_sample as u32)
-            % self.spec.channels as u32 != 0 {
+        if (self.data_bytes_written / self.bytes_per_sample as u64)
+            % self.spec.channels as u64 != 0 {
             Err(Error::UnfinishedSample)
         } else {
             Ok(())
@@ -594,17 +716,30 @@ impl<W> WavWriter<W>
     ///
     /// The duration is independent of the number of channels. It is expressed
     /// in units of samples. The duration in seconds can be obtained by
-    /// dividing this number by the sample rate.
+    /// dividing this number by the sample rate. The return value saturates at
+    /// `u32::MAX` for RF64 files that hold more samples than that.
     pub fn duration(&self) -> u32 {
-        self.data_bytes_written / (self.bytes_per_sample as u32 * self.spec.channels as u32)
+        let duration = self.data_bytes_written
+            / (self.bytes_per_sample as u64 * self.spec.channels as u64);
+        if duration > std::u32::MAX as u64 {
+            std::u32::MAX
+        } else {
+            duration as u32
+        }
     }
 
     /// Returns the number of samples in the file written so far.
     ///
     /// The length of the file is its duration (in samples) times the number of
-    /// channels.
+    /// channels. The return value saturates at `u32::MAX` for RF64 files that
+    /// hold more samples than that.
     pub fn len(&self) -> u32 {
-        self.data_bytes_written / self.bytes_per_sample as u32
+        let len = self.data_bytes_written / self.bytes_per_sample as u64;
+        if len > std::u32::MAX as u64 {
+            std::u32::MAX
+        } else {
+            len as u32
+        }
     }
 }
 
@@ -626,9 +761,18 @@ impl<W> Drop for WavWriter<W>
 /// Returns (spec_ex, data_len, data_len_offset).
 fn read_append<W: io::Read + io::Seek>(mut reader: &mut W) -> Result<(WavSpecEx, u32, u32)> {
     let (spec_ex, data_len) = {
-        try!(read::read_wave_header(&mut reader));
-        try!(read::read_until_data(&mut reader))
+        let (riff_kind, _file_len) = try!(read::read_riff_header(&mut reader));
+        if riff_kind == read::RiffKind::Rf64 {
+            // Appending to an RF64 file is not supported: the ds64 chunk would
+            // have to be updated, and the data chunk length field is a
+            // placeholder rather than a real length.
+            return Err(Error::Unsupported);
+        }
+        try!(read::read_until_data(&mut reader, false))
     };
+
+    // A classic RIFF data chunk has a 32-bit length, so this always fits.
+    let data_len = data_len as u32;
 
     // Record the position of the data chunk length, so we can overwrite it
     // later.
@@ -708,10 +852,11 @@ impl WavWriter<io::BufWriter<fs::File>> {
             spec: spec_ex.spec,
             bytes_per_sample: spec_ex.bytes_per_sample,
             writer: buf_writer,
-            data_bytes_written: data_len,
+            data_bytes_written: data_len as u64,
             sample_writer_buffer: Vec::new(),
             finalized: false,
             data_len_offset: data_len_offset,
+            rf64: false,
         };
 
         Ok(writer)
@@ -738,10 +883,11 @@ impl<W> WavWriter<W> where W: io::Read + io::Write + io::Seek {
             spec: spec_ex.spec,
             bytes_per_sample: spec_ex.bytes_per_sample,
             writer: writer,
-            data_bytes_written: data_len,
+            data_bytes_written: data_len as u64,
             sample_writer_buffer: Vec::new(),
             finalized: false,
             data_len_offset: data_len_offset,
+            rf64: false,
         };
 
         Ok(writer)
@@ -773,7 +919,7 @@ pub struct SampleWriter16<'parent, W> where W: io::Write + io::Seek + 'parent {
     buffer: &'parent mut [MaybeUninit<u8>],
 
     /// Reference to the `data_bytes_written` field of the writer.
-    data_bytes_written: &'parent mut u32,
+    data_bytes_written: &'parent mut u64,
 
     /// The index into the buffer where the next bytes will be written.
     ///
@@ -857,9 +1003,9 @@ impl<'parent, W: io::Write + io::Seek> SampleWriter16<'parent, W> {
 
         try!(self.writer.write_all(slice));
 
-        // The narrowing to u32 and the add do not fail, because at construction
-        // time we limit the buffer size.
-        *self.data_bytes_written += self.buffer.len() as u32;
+        // The add does not overflow, because at construction time we limit
+        // the buffer size to what still fits in the data section.
+        *self.data_bytes_written += self.buffer.len() as u64;
 
         Ok(())
     }
